@@ -22,13 +22,65 @@ Do not make additional WordPress, Merchant, feed, robots, permalink, cache, data
 Eight prior XML path differences were already proven correct by variation ID and MUST NOT be rewritten to the older proposed paths:
 14901, 14902, 14938, 14939, 14950, 14951, 15258, 15259.
 
-## Verification required after your current repair
+## Current verified checkpoint — 2026-08-17
 
-1. Run the current repository audit:
+Manual independent fetches of the two current XML FILE sources established:
+
+- PRODUCTS SOURCE 8: 1868 items / 1868 links / 49 double-encoded links
+- PRODUCTS SOURCE 9: 1868 items / 1868 links / 49 double-encoded links
+- Source 8 SHA-256: `A2B1602673FF9E4AF3A242A6F606A22F5E0840391EF176E8635DD16438143379`
+- Source 9 SHA-256: `1B6417A98E30D7EAD901D94B23A13B6CEE91E192B5D49D85D437B836AC057FBD`
+- The files are different.
+- Exact bad-link intersection: 0
+- Source-8-only exact bad links: 49
+- Source-9-only exact bad links: 49
+- Bad Product/Offer ID intersection: 49
+- Source-8-only bad IDs: 0
+- Source-9-only bad IDs: 0
+
+Interpretation: this is one shared set of 49 affected product/offer IDs rendered differently by the two feeds. Do NOT treat it as 98 independent products and do NOT perform feed-by-feed blind rewrites.
+
+## Required next diagnostic — cross-source pair classification
+
+Run:
 
 ```bash
 cd /workspaces/allwaa-ai-store-manager1
 git pull
+PYTHONPATH=src .venv/bin/python tools/merchant_feed_source_pair_compare.py
+```
+
+This tool is READ ONLY and must report:
+
+```text
+Same product IDs       : 49
+Only left product IDs  : 0
+Only right product IDs : 0
+Same exact links       : 0
+```
+
+Also capture:
+
+- Same semantic URLs
+- Same paths
+- Same variant-key sets
+- CLASSIFICATIONS counts
+
+Decision rule:
+
+1. If most/all rows are `ENCODING_ONLY_DIFFERENCE`, fix only the extra encoding layer at the shared URL-generation point.
+2. If rows are `SAME_PATH_KEYS_DIFFERENT_VALUES_OR_EXTRA_QUERY`, inspect per-source variation-value generation before any write.
+3. If rows are `SAME_PATH_DIFFERENT_QUERY_SHAPE`, identify why source settings generate different parameter sets; do not normalize blindly.
+4. If rows are `DIFFERENT_PATH`, validate variation/product semantics for each affected offer ID before any rewrite.
+5. Never convert variation links to parent-product links merely to remove query parameters.
+
+After this comparison, STOP and report the classification counts plus a small sample of offer IDs from each non-zero class. Do not perform another write wave until the shared root cause is identified.
+
+## Full verification required after the eventual repair
+
+1. Run the current repository audit:
+
+```bash
 PYTHONPATH=src .venv/bin/python tools/merchant_feed_double_encoding_scope.py
 ```
 
