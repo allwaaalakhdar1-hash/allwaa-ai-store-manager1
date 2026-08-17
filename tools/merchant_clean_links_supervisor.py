@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 HISTORY_DIR = ROOT / "data" / "agent_history"
 LATEST_STATE = ROOT / "data" / "merchant_clean_links_supervisor_latest.json"
 ROLLOUT_SCRIPT = ROOT / "tools" / "merchant_clean_links_rollout.py"
+FEED_SCOPE_SCRIPT = ROOT / "tools" / "merchant_feed_double_encoding_scope.py"
+FEED_SCOPE_JSON = ROOT / "data" / "merchant_feed_double_encoding_scope.json"
 PYTHON = ROOT / ".venv" / "bin" / "python"
 
 MERCHANT_ID_DEFAULT = os.getenv("GOOGLE_MERCHANT_ID", "5580031112")
@@ -83,6 +85,75 @@ def recent_rollout_activity() -> tuple[str | None, float | None]:
     return label, age_hours
 
 
+def run_feed_integrity_guard() -> dict[str, Any]:
+    """Run the live XML double-encoding audit before any Merchant write decision."""
+    if not FEED_SCOPE_SCRIPT.exists():
+        return {"ok": False, "error": f"Missing {FEED_SCOPE_SCRIPT}"}
+    if not PYTHON.exists():
+        return {"ok": False, "error": f"Missing {PYTHON}"}
+
+    env = dict(os.environ)
+    src = str(ROOT / "src")
+    env["PYTHONPATH"] = src if not env.get("PYTHONPATH") else f"{src}:{env['PYTHONPATH']}"
+
+    proc = subprocess.run(
+        [str(PYTHON), str(FEED_SCOPE_SCRIPT)],
+        cwd=ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=240,
+    )
+    if proc.returncode != 0:
+        return {
+            "ok": False,
+            "returncode": proc.returncode,
+            "stdoutTail": proc.stdout[-2000:],
+            "stderrTail": proc.stderr[-2000:],
+        }
+    if not FEED_SCOPE_JSON.exists():
+        return {"ok": False, "error": f"Audit did not produce {FEED_SCOPE_JSON}"}
+
+    try:
+        payload = json.loads(FEED_SCOPE_JSON.read_text(encoding="utf-8"))
+    except Exception as exc:
+        return {"ok": False, "error": f"Cannot parse feed audit JSON: {exc!r}"}
+
+    summary = payload.get("summary", {}) or {}
+    by_source = payload.get("bySource", {}) or {}
+    results = payload.get("results", []) or []
+    double_count = int(summary.get("double_encoded_links", 0) or 0)
+
+    bad_ids_by_source: dict[str, set[str]] = {}
+    for row in results:
+        source = str(row.get("dataSource") or "")
+        offer_id = str(row.get("offerId") or "")
+        if not source or not offer_id:
+            continue
+        bad_ids_by_source.setdefault(source, set()).add(offer_id)
+
+    source_names = sorted(bad_ids_by_source)
+    shared_ids: set[str] = set()
+    if source_names:
+        shared_ids = set(bad_ids_by_source[source_names[0]])
+        for name in source_names[1:]:
+            shared_ids &= bad_ids_by_source[name]
+
+    return {
+        "ok": True,
+        "doubleEncodedLinks": double_count,
+        "itemsWithLink": int(summary.get("items_with_link", 0) or 0),
+        "knownCurrentMerchantBad": int(summary.get("KNOWN_CURRENT_MERCHANT_BAD", 0) or 0),
+        "latentDoubleEncoded": int(summary.get("LATENT_DOUBLE_ENCODED_IN_FEED", 0) or 0),
+        "bySource": by_source,
+        "badUniqueIdsBySource": {k: len(v) for k, v in bad_ids_by_source.items()},
+        "sharedBadIds": len(shared_ids),
+        "sharedBadIdSample": sorted(shared_ids)[:20],
+        "scopeJson": str(FEED_SCOPE_JSON.relative_to(ROOT)),
+    }
+
+
 def fetch_merchant_aggregate(merchant_id: str) -> dict[str, Any]:
     """Read-only Merchant API aggregate status snapshot."""
     try:
@@ -139,16 +210,11 @@ def fetch_merchant_aggregate(merchant_id: str) -> dict[str, Any]:
             if not page_token:
                 break
             if pages >= 20:
-                return {
-                    "ok": False,
-                    "error": "Merchant API pagination safety limit reached",
-                }
+                return {"ok": False, "error": "Merchant API pagination safety limit reached"}
 
         max_by_code: dict[str, int] = {code: 0 for code in TARGET_ISSUES}
         for row in rows:
-            max_by_code[row["code"]] = max(
-                max_by_code[row["code"]], row["numProducts"]
-            )
+            max_by_code[row["code"]] = max(max_by_code[row["code"]], row["numProducts"])
         return {
             "ok": True,
             "pages": pages,
@@ -170,15 +236,8 @@ def start_rollout() -> dict[str, Any]:
     stamp = utc_now().strftime("%Y%m%d_%H%M%S")
     log_path = HISTORY_DIR / f"merchant_clean_links_rollout_resume_{stamp}.log"
     cmd = [
-        str(PYTHON),
-        str(ROLLOUT_SCRIPT),
-        "--auto",
-        "--batch-size",
-        "100",
-        "--wait-seconds",
-        "300",
-        "--verify-retries",
-        "12",
+        str(PYTHON), str(ROLLOUT_SCRIPT),
+        "--auto", "--batch-size", "100", "--wait-seconds", "300", "--verify-retries", "12",
     ]
     with log_path.open("ab", buffering=0) as log_handle:
         proc = subprocess.Popen(
@@ -207,15 +266,22 @@ def write_state(state: dict[str, Any]) -> Path:
     return history_path
 
 
+def finish(state: dict[str, Any]) -> int:
+    path = write_state(state)
+    print(json.dumps(state, ensure_ascii=False, indent=2))
+    print(f"\nSaved: {path.relative_to(ROOT)}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Safely supervise/resume the Allwaa Merchant clean-link rollout."
+        description="Safely supervise the Allwaa Merchant clean-link/feed health workflow."
     )
     parser.add_argument("--merchant-id", default=MERCHANT_ID_DEFAULT)
     parser.add_argument(
         "--resume-if-stopped",
         action="store_true",
-        help="Resume the existing rollout only after safety gates pass.",
+        help="Resume the existing clean-link rollout only after every safety gate passes.",
     )
     parser.add_argument(
         "--cooldown-hours",
@@ -230,17 +296,79 @@ def main() -> int:
         "task": "MERCHANT_CLEAN_LINK_ROLLOUT_SUPERVISOR",
         "readOnlyChecks": True,
         "merchantId": args.merchant_id,
-        "rolloutScript": str(ROLLOUT_SCRIPT.relative_to(ROOT)),
-        "expectedRolloutArgs": [
-            "--auto",
-            "--batch-size", "100",
-            "--wait-seconds", "300",
-            "--verify-retries", "12",
-        ],
+        "feedAcceptance": {
+            "doubleEncodedLinks": 0,
+            "latentDoubleEncoded": 0,
+            "rule": "Never declare URL repair complete while the generated XML still contains double-encoded variation links.",
+        },
+        "verifiedCheckpoint": {
+            "source8": {"items": 1868, "links": 1868, "doubleEncoded": 49},
+            "source9": {"items": 1868, "links": 1868, "doubleEncoded": 49},
+            "sharedBadProductIds": 49,
+            "sameExactBadLinks": 0,
+            "interpretation": "One shared 49-ID defect rendered differently by two feed sources; likely shared feed-generation/encoding layer, not 98 independent products.",
+        },
     }
 
     running = active_rollouts()
     state["activeRolloutProcesses"] = running
+
+    # Feed XML truth is a hard safety gate. Merchant UI/API may lag behind regeneration.
+    feed_guard = run_feed_integrity_guard()
+    state["feedIntegrityGuard"] = feed_guard
+
+    if not feed_guard.get("ok"):
+        state["decision"] = {
+            "health": "FEED_INTEGRITY_UNKNOWN_STOP_WRITES",
+            "actions": [
+                {
+                    "priority": 1,
+                    "action": "RESTORE_LIVE_FEED_AUDIT",
+                    "reason": "The supervisor could not verify the current generated XML; no Merchant/link write should start without feed truth.",
+                }
+            ],
+        }
+        return finish(state)
+
+    if int(feed_guard.get("doubleEncodedLinks", 0) or 0) > 0:
+        state["decision"] = {
+            "health": "FEED_GENERATOR_REGRESSION_DETECTED",
+            "actions": [
+                {
+                    "priority": 1,
+                    "action": "DIAGNOSE_SHARED_FEED_URL_GENERATOR",
+                    "reason": (
+                        f"Current generated XML still contains {feed_guard.get('doubleEncodedLinks')} double-encoded links. "
+                        "Do not hide this with redirects or another clean-link write wave."
+                    ),
+                },
+                {
+                    "priority": 2,
+                    "action": "RUN_SOURCE_PAIR_CLASSIFICATION",
+                    "reason": "Classify the same affected offer IDs across both feeds and fix only the shared encoding/generation layer.",
+                    "command": "PYTHONPATH=src .venv/bin/python tools/merchant_feed_source_pair_compare.py",
+                },
+                {
+                    "priority": 3,
+                    "action": "KEEP_WOOCOMMERCE_ROUTES_UNCHANGED",
+                    "reason": "Current product/canonical routes were previously verified healthy; variation query semantics must be preserved.",
+                },
+            ],
+        }
+        return finish(state)
+
+    if int(feed_guard.get("latentDoubleEncoded", 0) or 0) > 0:
+        state["decision"] = {
+            "health": "LATENT_FEED_ENCODING_DEFECT_STOP_WRITES",
+            "actions": [
+                {
+                    "priority": 1,
+                    "action": "FIX_LATENT_FEED_ENCODING",
+                    "reason": "Merchant may not yet report every malformed feed URL, but the XML itself still fails acceptance.",
+                }
+            ],
+        }
+        return finish(state)
 
     if running:
         state["decision"] = {
@@ -254,15 +382,12 @@ def main() -> int:
                 {
                     "priority": 2,
                     "action": "CONTINUE_READ_ONLY_MONITORING",
-                    "reason": "Read-only Merchant/Woo/GSC observation is safe while rollout is active.",
+                    "reason": "Generated XML currently passes the feed encoding gate.",
                 },
             ],
         }
         state["merchantAggregate"] = fetch_merchant_aggregate(args.merchant_id)
-        path = write_state(state)
-        print(json.dumps(state, ensure_ascii=False, indent=2))
-        print(f"\nSaved: {path.relative_to(ROOT)}")
-        return 0
+        return finish(state)
 
     merchant = fetch_merchant_aggregate(args.merchant_id)
     state["merchantAggregate"] = merchant
@@ -277,7 +402,7 @@ def main() -> int:
                 {
                     "priority": 1,
                     "action": "RESTORE_MERCHANT_READ_ACCESS",
-                    "reason": "Cannot safely decide whether to resume a Merchant write without a fresh read-only Merchant status snapshot.",
+                    "reason": "Feed XML passes, but a fresh Merchant status snapshot is required before any further write decision.",
                 }
             ],
         }
@@ -291,7 +416,7 @@ def main() -> int:
                     {
                         "priority": 1,
                         "action": "DO_NOT_RESTART_ROLLOUT",
-                        "reason": "No target landing-page/link crawl issues remain in the fresh GCC aggregate snapshot.",
+                        "reason": "Generated XML passes and no target landing-page/link crawl issues remain in the fresh GCC aggregate snapshot.",
                     },
                     {
                         "priority": 2,
@@ -324,7 +449,7 @@ def main() -> int:
                         {
                             "priority": 1,
                             "action": "MONITOR_CLEAN_LINK_ROLLOUT",
-                            "reason": "No rollout was active, link issues remain after cooldown, and the existing approved rollout was resumed.",
+                            "reason": "All feed safety gates passed; target Merchant issues remain after cooldown; existing approved rollout resumed.",
                         }
                     ],
                 }
@@ -346,15 +471,12 @@ def main() -> int:
                     {
                         "priority": 1,
                         "action": "RESUME_EXISTING_CLEAN_LINK_ROLLOUT",
-                        "reason": "No rollout process is active and target landing-page/link issues remain after the safety cooldown.",
+                        "reason": "Feed XML passes; no rollout process is active; target Merchant issues remain after the safety cooldown.",
                     }
                 ],
             }
 
-    path = write_state(state)
-    print(json.dumps(state, ensure_ascii=False, indent=2))
-    print(f"\nSaved: {path.relative_to(ROOT)}")
-    return 0
+    return finish(state)
 
 
 if __name__ == "__main__":
