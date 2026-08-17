@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import csv
 import json
+import re
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -15,10 +16,25 @@ ORIGIN = ROOT / "data" / "merchant_source_origin_probe.json"
 KNOWN = ROOT / "data" / "merchant_file_feed_link_probe.json"
 OUT_JSON = ROOT / "data" / "merchant_feed_double_encoding_scope.json"
 OUT_CSV = ROOT / "data" / "merchant_feed_double_encoding_scope.csv"
-UA = "Mozilla/5.0 (compatible; AllwaaMerchantFeedDoubleEncodingScope/1.0)"
+UA = "Mozilla/5.0 (compatible; AllwaaMerchantFeedDoubleEncodingScope/1.1)"
 TRACKING_KEYS = {
     "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content", "utm_id",
     "gclid", "gbraid", "wbraid", "fbclid", "msclkid",
+}
+
+# Actionable defect definition: an attribute_pa_* variation VALUE still contains an
+# encoded percent byte marker (%25XX), i.e. it has one encoding layer too many.
+# This intentionally matches the independent PowerShell and fetch-consistency probes.
+ACTIONABLE_DOUBLE_RE = re.compile(
+    r"attribute_pa_[^=&<]*=[^&<]*%25[0-9A-Fa-f]{2}",
+    re.IGNORECASE,
+)
+
+# These eight offer IDs were previously verified by variation ID/path semantics and
+# must never be rewritten merely because a broad '%25 anywhere' heuristic sees them.
+PROTECTED_OFFER_IDS = {
+    "14901", "14902", "14938", "14939",
+    "14950", "14951", "15258", "15259",
 }
 
 
@@ -94,6 +110,7 @@ def main() -> int:
     session.headers.update({"User-Agent": UA, "Accept": "application/xml,text/xml,*/*"})
 
     results = []
+    broad_only_results = []
     total_counts = Counter()
     source_counts = defaultdict(Counter)
     key_counts = Counter()
@@ -126,8 +143,29 @@ def main() -> int:
             total_counts["items_with_link"] += 1
             source_counts[source_name]["items_with_link"] += 1
 
-            has_double = "%25" in link.lower()
-            if not has_double:
+            has_percent25_anywhere = "%25" in link.lower()
+            has_actionable_double = bool(ACTIONABLE_DOUBLE_RE.search(link))
+
+            if has_percent25_anywhere:
+                total_counts["percent25_anywhere_links"] += 1
+                source_counts[source_name]["percent25_anywhere_links"] += 1
+
+            if has_percent25_anywhere and not has_actionable_double:
+                total_counts["broad_percent25_only"] += 1
+                source_counts[source_name]["broad_percent25_only"] += 1
+                protected = oid in PROTECTED_OFFER_IDS
+                if protected:
+                    total_counts["protected_broad_only"] += 1
+                    source_counts[source_name]["protected_broad_only"] += 1
+                broad_only_results.append({
+                    "offerId": oid,
+                    "dataSource": source_name,
+                    "sourceDisplayName": display,
+                    "protectedOfferId": protected,
+                    "feedLink": link,
+                })
+
+            if not has_actionable_double:
                 continue
 
             total_counts["double_encoded_links"] += 1
@@ -160,18 +198,35 @@ def main() -> int:
             source_counts[source_name][status] += 1
 
         sc = source_counts[source_name]
-        print("Items with link       :", sc["items_with_link"])
-        print("Double-encoded links  :", sc["double_encoded_links"])
-        print("Known Merchant bad    :", sc["KNOWN_CURRENT_MERCHANT_BAD"])
-        print("Latent in feed        :", sc["LATENT_DOUBLE_ENCODED_IN_FEED"])
+        print("Items with link                 :", sc["items_with_link"])
+        print("%25 anywhere links              :", sc["percent25_anywhere_links"])
+        print("Actionable double-encoded links :", sc["double_encoded_links"])
+        print("Broad-only %25 links            :", sc["broad_percent25_only"])
+        print("Protected broad-only            :", sc["protected_broad_only"])
+        print("Known Merchant bad              :", sc["KNOWN_CURRENT_MERCHANT_BAD"])
+        print("Latent actionable               :", sc["LATENT_DOUBLE_ENCODED_IN_FEED"])
+
+    broad_only_unique_ids = sorted({str(r.get("offerId") or "") for r in broad_only_results if r.get("offerId")})
+    protected_broad_only_unique_ids = sorted({
+        str(r.get("offerId") or "")
+        for r in broad_only_results
+        if r.get("offerId") and r.get("protectedOfferId")
+    })
+    unexpected_broad_only_unique_ids = sorted(set(broad_only_unique_ids) - PROTECTED_OFFER_IDS)
 
     payload = {
         "readOnly": True,
+        "criterionVersion": "1.1-variation-value-double-encoding",
+        "actionablePattern": ACTIONABLE_DOUBLE_RE.pattern,
         "sourceCount": len(file_sources),
         "summary": dict(total_counts),
         "bySource": {k: dict(v) for k, v in source_counts.items()},
         "byVariantKey": dict(key_counts.most_common()),
+        "broadOnlyUniqueIds": broad_only_unique_ids,
+        "protectedBroadOnlyUniqueIds": protected_broad_only_unique_ids,
+        "unexpectedBroadOnlyUniqueIds": unexpected_broad_only_unique_ids,
         "results": results,
+        "broadOnlyResults": broad_only_results,
     }
     OUT_JSON.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -192,13 +247,24 @@ def main() -> int:
     print("=" * 110)
     print("FILE sources                    :", len(file_sources))
     print("Items with link                 :", total_counts["items_with_link"])
+    print("%25 anywhere links              :", total_counts["percent25_anywhere_links"])
     print("Double-encoded links in XML     :", total_counts["double_encoded_links"])
+    print("Broad-only %25 links            :", total_counts["broad_percent25_only"])
+    print("Protected broad-only occurrences:", total_counts["protected_broad_only"])
     print("Known current Merchant bad      :", total_counts["KNOWN_CURRENT_MERCHANT_BAD"])
     print("Latent double-encoded in XML    :", total_counts["LATENT_DOUBLE_ENCODED_IN_FEED"])
+    print("Broad-only unique IDs           :", len(broad_only_unique_ids))
+    print("Protected broad-only unique IDs :", len(protected_broad_only_unique_ids))
+    print("Unexpected broad-only unique IDs:", len(unexpected_broad_only_unique_ids))
+    if broad_only_unique_ids:
+        print("Broad-only IDs                  :", ", ".join(broad_only_unique_ids))
+    if unexpected_broad_only_unique_ids:
+        print("Unexpected broad-only IDs       :", ", ".join(unexpected_broad_only_unique_ids))
     print("BY SOURCE")
     for source_name, c in sorted(source_counts.items()):
         print(
-            f"  {source_name} | links={c['items_with_link']} | double={c['double_encoded_links']} | "
+            f"  {source_name} | links={c['items_with_link']} | any25={c['percent25_anywhere_links']} | "
+            f"double={c['double_encoded_links']} | broad_only={c['broad_percent25_only']} | "
             f"known={c['KNOWN_CURRENT_MERCHANT_BAD']} | latent={c['LATENT_DOUBLE_ENCODED_IN_FEED']}"
         )
     print("BY VARIANT KEY")
